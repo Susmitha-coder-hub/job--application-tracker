@@ -1,7 +1,7 @@
 const JobApplication = require('../models/jobApplicationModel'); // use the exact filename
 const { canTransition } = require("../services/applicationStateService");
 const ApplicationHistory = require('../models/ApplicationHistory'); // For audit trail
-const sendStageChangeEmail = require('../utils/email'); // For email notifications
+const sendStageChangeEmail = require('../services/emailService'); // For email notifications
 
 
 // Create a new job application
@@ -114,14 +114,17 @@ const changeApplicationStage = async (req, res) => {
     });
 
     // 🔔 SEND EMAIL (THIS WAS MISSING)
-    if (application.user.email) {
-      await sendStageChangeEmail(
-        application.user.email,
-        application.title,
-        previousStage,
-        stage
-      );
-    }
+    if (application.user?.email) {
+     console.log("📨 Sending email to:", application.user.email);
+     await sendStageChangeEmail(
+     application.user.email,
+     application.title,
+     previousStage,
+     stage
+  );
+}
+
+
 
     res.json({
       message: "Application stage updated successfully",
