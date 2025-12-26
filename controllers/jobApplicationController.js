@@ -1,147 +1,132 @@
-const JobApplication = require('../models/jobApplicationModel'); // use the exact filename
-const { canTransition } = require("../services/applicationStateService");
-const ApplicationHistory = require('../models/ApplicationHistory'); // For audit trail
-const sendStageChangeEmail = require('../services/emailService'); // For email notifications
+// controllers/jobApplicationController.js
+const mongoose = require('mongoose');
+const { body, validationResult } = require('express-validator');
+const JobApplication = require('../models/JobApplication');
+const ApplicationHistory = require('../models/ApplicationHistory');
+const { sendStageChangeEmail } = require('../services/emailservices');
+const { VALID_TRANSITIONS } = require('../services/applicationStateService');
 
+// ------------------- Candidate Endpoints ------------------- //
 
-// Create a new job application
-const createJobApplication = async (req, res) => {
+// Create a job application
+const createApplication = async (req, res) => {
+  // Input validation
+  await body('title').notEmpty().withMessage('Title is required').run(req);
+  await body('company').notEmpty().withMessage('Company is required').run(req);
+
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
   try {
-    const { title, company, candidateEmail } = req.body;
-
-    const job = await JobApplication.create({
-      title,
-      company,
-      user: req.user.userId, // from auth middleware
-      candidateEmail // store candidate email if needed
+    const application = await JobApplication.create({
+      ...req.body,
+      candidate: req.user.id, // assuming req.user.id comes from JWT
     });
-
-    res.status(201).json(job);
+    res.status(201).json(application);
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(500).json({ error: error.message });
   }
 };
 
-
-// Get all job applications for the logged-in user
-const getJobApplications = async (req, res) => {
+// Get all applications for the logged-in candidate
+const getMyApplications = async (req, res) => {
   try {
-    const jobs = await JobApplication.find({ user: req.user.userId });
-    res.json(jobs);
+    const applications = await JobApplication.find({ candidate: req.user.id });
+    res.status(200).json(applications);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    res.status(500).json({ error: error.message });
   }
 };
 
+// Update a job application (except stage)
+const updateApplication = async (req, res) => {
+  const updates = { ...req.body };
+  delete updates.stage; // candidates cannot update stage
 
-// Update a job application (EXCEPT stage)
-const updateJobApplication = async (req, res) => {
   try {
-    // 🚫 Prevent stage update here
-    if (req.body.stage) {
-      return res.status(403).json({
-        message: "Stage cannot be updated using this endpoint",
-      });
-    }
-
-    const { id } = req.params;
-
-    const job = await JobApplication.findOneAndUpdate(
-      { _id: id, user: req.user.userId },
-      req.body,
+    const application = await JobApplication.findOneAndUpdate(
+      { _id: req.params.id, candidate: req.user.id },
+      updates,
       { new: true }
     );
-
-    if (!job) {
-      return res.status(404).json({ message: 'Job not found' });
-    }
-
-    res.json(job);
+    if (!application) return res.status(404).json({ error: 'Application not found' });
+    res.status(200).json(application);
   } catch (error) {
-    res.status(400).json({ message: error.message });
+    res.status(500).json({ error: error.message });
   }
 };
-
 
 // Delete a job application
-const deleteJobApplication = async (req, res) => {
+const deleteApplication = async (req, res) => {
   try {
-    const { id } = req.params;
-
-    const job = await JobApplication.findOneAndDelete({
-      _id: id,
-      user: req.user.userId,
+    const application = await JobApplication.findOneAndDelete({
+      _id: req.params.id,
+      candidate: req.user.id,
     });
-
-    if (!job) {
-      return res.status(404).json({ message: 'Job not found' });
-    }
-
-    res.json({ message: 'Job deleted successfully' });
+    if (!application) return res.status(404).json({ error: 'Application not found' });
+    res.status(200).json({ message: 'Application deleted successfully' });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    res.status(500).json({ error: error.message });
   }
 };
+
+// ------------------- Recruiter Endpoint ------------------- //
+
+// Change application stage
 const changeApplicationStage = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
   try {
-    const { id } = req.params;
-    const { stage } = req.body;
-
-    const application = await JobApplication.findById(id).populate("user");
+    const application = await JobApplication.findById(req.params.id).session(session);
     if (!application) {
-      return res.status(404).json({ message: "Application not found" });
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({ error: 'Application not found' });
     }
 
-    const previousStage = application.stage;
+    const prevStage = application.stage;
+    const nextStage = req.body.stage;
 
-    // validate workflow
-    if (!canTransition(previousStage, stage)) {
-      return res.status(400).json({
-        message: `Invalid transition from ${previousStage} to ${stage}`,
-      });
+    // Validate stage transition
+    if (!VALID_TRANSITIONS[prevStage].includes(nextStage)) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(400).json({ error: `Invalid stage transition from ${prevStage} to ${nextStage}` });
     }
 
-    // update stage
-    application.stage = stage;
-    await application.save();
+    application.stage = nextStage;
+    await application.save({ session });
 
-    // save history
-    await ApplicationHistory.create({
-      jobApplicationId: application._id,
-      previousStage,
-      newStage: stage,
-      changedBy: req.user.userId,
+    // Log history
+    await ApplicationHistory.create(
+      [{ application: application._id, from: prevStage, to: nextStage }],
+      { session }
+    );
+
+    await session.commitTransaction();
+    session.endSession();
+
+    // Send email asynchronously
+    setImmediate(async () => {
+      try {
+        await sendStageChangeEmail(application);
+      } catch (err) {
+        console.error('Failed to send stage change email:', err.message);
+      }
     });
 
-    // 🔔 SEND EMAIL (THIS WAS MISSING)
-    if (application.user?.email) {
-     console.log("📨 Sending email to:", application.user.email);
-     await sendStageChangeEmail(
-     application.user.email,
-     application.title,
-     previousStage,
-     stage
-  );
-}
-
-
-
-    res.json({
-      message: "Application stage updated successfully",
-      application,
-    });
+    res.status(200).json({ message: 'Application stage updated successfully', application });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: error.message });
+    await session.abortTransaction();
+    session.endSession();
+    res.status(500).json({ error: error.message });
   }
 };
 
-
-// ✅ EXPORT EVERYTHING
 module.exports = {
-  createJobApplication,
-  getJobApplications,
-  updateJobApplication,
-  deleteJobApplication,
+  createApplication,
+  getMyApplications,
+  updateApplication,
+  deleteApplication,
   changeApplicationStage,
 };
