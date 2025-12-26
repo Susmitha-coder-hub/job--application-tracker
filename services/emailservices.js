@@ -1,3 +1,4 @@
+// services/emailservices.js
 const nodemailer = require("nodemailer");
 
 const transporter = nodemailer.createTransport({
@@ -17,21 +18,21 @@ transporter.verify((error) => {
   }
 });
 
-async function sendStageChangeEmail(to, jobTitle, previousStage, newStage) {
+const sendStageChangeEmail = async (application) => {
   try {
-    console.log("📨 Sending email to:", to);
+    console.log("📨 Sending email to:", application.candidateEmail);
 
     await transporter.sendMail({
       from: '"Job Tracker" <no-reply@jobtracker.com>',
-      to,
-      subject: `Application update – ${jobTitle}`,
-      text: `Your application moved from ${previousStage} to ${newStage}.`,
+      to: application.candidateEmail, // candidate's email should be stored in JobApplication model
+      subject: `Application update – ${application.title}`,
+      text: `Hello ${application.candidateName},\n\nYour application moved from ${application.previousStage || application.stage} to ${application.stage}.`,
     });
 
-    console.log("✅ Email captured in Mailtrap");
+    console.log("✅ Email sent successfully");
   } catch (err) {
     console.error("❌ Email error:", err.message);
   }
-}
+};
 
-module.exports = sendStageChangeEmail;
+module.exports = { sendStageChangeEmail };
